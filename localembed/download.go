@@ -129,6 +129,19 @@ func Download(ctx context.Context, opts DownloadOptions) (*DownloadResult, error
 	}
 	opts.Model.Revision = hash
 
+	// An unpinned repository id's manifest may still be missing files that
+	// only modules.json itself reveals (a Dense projection, a Normalize
+	// step) — discover them now, before the loop below decides the download
+	// is complete. Registry models keep their hand-verified manifest as is.
+	if !m.Registered {
+		expanded, err := expandUnpinnedManifest(ctx, repo, opts, m, infoBody)
+		if err != nil {
+			return nil, err
+		}
+		m.Files = expanded
+		opts.Model.Files = expanded
+	}
+
 	result := &DownloadResult{ModelDir: opts.ModelDir, Verified: m.Pinned()}
 	for _, f := range m.Files {
 		if err := ctx.Err(); err != nil {
@@ -225,6 +238,42 @@ func snapshotHiddenSize(repoDir, commitHash string) int {
 		return 0
 	}
 	return cfg.HiddenSize
+}
+
+// expandUnpinnedManifest fetches modules.json ahead of the main download loop
+// below and folds in whatever extra module files it declares, via
+// [expandManifest]. Fetching it early — rather than waiting for the main loop
+// to reach it in manifest order — is what lets the loop's single pass over
+// m.Files download everything a Dense projection or Normalize module needs,
+// instead of only ever knowing about the plain Transformer+Pooling pair.
+//
+// The fetch here is not wasted work: fetchFile is idempotent, so the main loop
+// downloading modules.json again a moment later just finds it already present.
+func expandUnpinnedManifest(ctx context.Context, repo *hub.Repo, opts DownloadOptions, m Model, infoBody []byte) ([]ManifestFile, error) {
+	modulesFile, ok := findManifestFile(m.Files, "modules.json")
+	if !ok {
+		return m.Files, nil
+	}
+	path, _, err := fetchFile(ctx, repo, opts, modulesFile)
+	if err != nil {
+		return nil, err
+	}
+	// #nosec G304 -- path is inside the model directory this call just populated
+	modulesJSON, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading modules.json to discover extra model files: %w", err)
+	}
+	return expandManifest(modulesJSON, infoBody, m.Files)
+}
+
+// findManifestFile looks up one manifest entry by path.
+func findManifestFile(files []ManifestFile, path string) (ManifestFile, bool) {
+	for _, f := range files {
+		if f.Path == path {
+			return f, true
+		}
+	}
+	return ManifestFile{}, false
 }
 
 // fetchFile downloads one manifest file unless an acceptable copy is already

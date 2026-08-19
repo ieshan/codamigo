@@ -172,5 +172,33 @@ func ResolvePin(modelDir string, m Model) (Model, Pin, error) {
 		return m, p, nil
 	}
 	m.Revision = p.CommitHash
+	m.Files = expandManifestFromSnapshot(modelDir, m, p)
 	return m, p, nil
+}
+
+// expandManifestFromSnapshot is the load-time twin of [expandUnpinnedManifest]:
+// no network access is available here, so it reads modules.json from the
+// snapshot directory Revision now names, instead of fetching it, and reuses
+// the repository info the pin already carries.
+//
+// Any failure to read or parse falls back to m.Files unchanged rather than
+// failing ResolvePin outright: an unreadable or absent modules.json is exactly
+// what [MissingFiles] already reports on the base manifest, and a malformed
+// repoInfo is diagnosed later, when the caller actually needs it, rather than
+// here where the only consequence would be an incomplete manifest.
+func expandManifestFromSnapshot(modelDir string, m Model, p Pin) []ManifestFile {
+	snapshot, err := SnapshotDir(modelDir, m)
+	if err != nil {
+		return m.Files
+	}
+	// #nosec G304 -- path is inside the model directory ResolvePin was asked about
+	modulesJSON, err := os.ReadFile(filepath.Join(snapshot, "modules.json"))
+	if err != nil {
+		return m.Files
+	}
+	expanded, err := expandManifest(modulesJSON, p.RepoInfo, m.Files)
+	if err != nil {
+		return m.Files
+	}
+	return expanded
 }

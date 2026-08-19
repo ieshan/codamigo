@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -214,6 +215,91 @@ func TestResolvePin_RegistryRevisionWins(t *testing.T) {
 	if got.Revision != testHash {
 		t.Errorf("Revision = %q, want the compiled-in %q", got.Revision, testHash)
 	}
+}
+
+// TestResolvePin_DiscoversDenseModuleFromDisk is the offline twin of
+// TestDownload_DiscoversExtraModuleFiles: a snapshot downloaded before this
+// fix, or downloaded elsewhere, already has modules.json declaring a Dense
+// projection on disk. ResolvePin must fold in those extra files so
+// MissingFiles reports the truth — ready when the Dense files are present,
+// still missing when they are not — instead of the base manifest's blind spot.
+func TestResolvePin_DiscoversDenseModuleFromDisk(t *testing.T) {
+	repoDir := "models--org--model"
+	modulesJSON := `[
+		{"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+		{"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+		{"idx": 2, "name": "2", "path": "2_Dense", "type": "sentence_transformers.models.Dense"}
+	]`
+	repoInfo := `{"sha":"` + testHash + `","siblings":[
+		{"rfilename":"2_Dense/config.json","size":4},
+		{"rfilename":"2_Dense/model.safetensors","size":4}
+	]}`
+
+	setup := func(t *testing.T, dir string, writeDenseFiles bool) {
+		t.Helper()
+		snapshot := filepath.Join(dir, repoDir, "snapshots", testHash)
+		if err := os.MkdirAll(snapshot, 0o750); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(snapshot, "modules.json"), []byte(modulesJSON), 0o600); err != nil {
+			t.Fatalf("WriteFile modules.json: %v", err)
+		}
+		// unpinnedTestModel's base manifest is just config.json; put it on disk
+		// too, so the only thing under test is whether the Dense discovery
+		// changes the verdict.
+		if err := os.WriteFile(filepath.Join(snapshot, "config.json"), []byte("test"), 0o600); err != nil {
+			t.Fatalf("WriteFile config.json: %v", err)
+		}
+		if err := localembed.WritePin(dir, localembed.Pin{
+			RepoID: "org/model", CommitHash: testHash, ResolvedFrom: "main",
+			RepoInfo: json.RawMessage(repoInfo),
+		}); err != nil {
+			t.Fatalf("WritePin: %v", err)
+		}
+		if !writeDenseFiles {
+			return
+		}
+		if err := os.MkdirAll(filepath.Join(snapshot, "2_Dense"), 0o750); err != nil {
+			t.Fatalf("MkdirAll 2_Dense: %v", err)
+		}
+		for _, name := range []string{"config.json", "model.safetensors"} {
+			if err := os.WriteFile(filepath.Join(snapshot, "2_Dense", name), []byte("test"), 0o600); err != nil {
+				t.Fatalf("WriteFile 2_Dense/%s: %v", name, err)
+			}
+		}
+	}
+
+	t.Run("dense files present", func(t *testing.T) {
+		dir := t.TempDir()
+		setup(t, dir, true)
+		resolved, _, err := localembed.ResolvePin(dir, unpinnedTestModel())
+		if err != nil {
+			t.Fatalf("ResolvePin: %v", err)
+		}
+		missing, err := localembed.MissingFiles(dir, resolved)
+		if err != nil {
+			t.Fatalf("MissingFiles: %v", err)
+		}
+		if len(missing) != 0 {
+			t.Errorf("MissingFiles = %v, want none once the Dense files are on disk", missing)
+		}
+	})
+
+	t.Run("dense files absent", func(t *testing.T) {
+		dir := t.TempDir()
+		setup(t, dir, false)
+		resolved, _, err := localembed.ResolvePin(dir, unpinnedTestModel())
+		if err != nil {
+			t.Fatalf("ResolvePin: %v", err)
+		}
+		missing, err := localembed.MissingFiles(dir, resolved)
+		if err != nil {
+			t.Fatalf("MissingFiles: %v", err)
+		}
+		if !slices.Contains(missing, "2_Dense/config.json") || !slices.Contains(missing, "2_Dense/model.safetensors") {
+			t.Errorf("MissingFiles = %v, want it to name the missing Dense files", missing)
+		}
+	})
 }
 
 func TestResolvePin_RegistryMismatchIsRefused(t *testing.T) {

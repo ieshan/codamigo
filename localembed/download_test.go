@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -30,6 +31,9 @@ type fakeHub struct {
 	// requests counts GETs of file content, so an idempotent second run can be
 	// distinguished from a re-download.
 	requests map[string]int
+	// lfsSHA256, keyed by rfilename, is reported as that sibling's lfs.sha256
+	// in the repository info, the way HuggingFace does for large files.
+	lfsSHA256 map[string]string
 }
 
 const fakeRevision = "0123456789abcdef0123456789abcdef01234567"
@@ -46,7 +50,11 @@ func newFakeHub(t *testing.T, repoID string, files map[string]string) *fakeHub {
 		}
 		siblings := make([]map[string]any, 0, len(files))
 		for name, content := range files {
-			siblings = append(siblings, map[string]any{"rfilename": name, "size": len(content)})
+			sib := map[string]any{"rfilename": name, "size": len(content)}
+			if sum, ok := hub.lfsSHA256[name]; ok {
+				sib["lfs"] = map[string]any{"sha256": sum, "size": len(content)}
+			}
+			siblings = append(siblings, sib)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -493,6 +501,84 @@ func TestDownload_WritesPin(t *testing.T) {
 	}
 	if meta.SHA != fakeRevision {
 		t.Errorf("pin.RepoInfo sha = %q, want %q", meta.SHA, fakeRevision)
+	}
+}
+
+// TestDownload_DiscoversExtraModuleFiles is the regression test for
+// google/embeddinggemma-300m: an unpinned repository id whose modules.json
+// declares a Dense projection module must have that module's files
+// downloaded too, not just the plain Transformer+Pooling pair standardManifest
+// assumes.
+func TestDownload_DiscoversExtraModuleFiles(t *testing.T) {
+	files := map[string]string{
+		"config.json":                       `{"hidden_size": 8}`,
+		"config_sentence_transformers.json": `{}`,
+		"modules.json": `[
+			{"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+			{"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+			{"idx": 2, "name": "2", "path": "2_Dense", "type": "sentence_transformers.models.Dense"}
+		]`,
+		"tokenizer.json":            `{}`,
+		"tokenizer_config.json":     `{}`,
+		"1_Pooling/config.json":     `{"pooling_mode_cls_token": true}`,
+		"model.safetensors":         strings.Repeat("w", 512),
+		"2_Dense/config.json":       `{"in_features": 8, "out_features": 8}`,
+		"2_Dense/model.safetensors": strings.Repeat("d", 64),
+	}
+	repoID := "test-org/dense-model"
+	hub := newFakeHub(t, repoID, files)
+	hub.lfsSHA256 = map[string]string{
+		"2_Dense/model.safetensors": func() string {
+			sum := sha256.Sum256([]byte(files["2_Dense/model.safetensors"]))
+			return hex.EncodeToString(sum[:])
+		}(),
+	}
+
+	base := make([]localembed.ManifestFile, 0)
+	for _, p := range []string{
+		"config.json", "config_sentence_transformers.json", "modules.json",
+		"tokenizer.json", "tokenizer_config.json", "1_Pooling/config.json", "model.safetensors",
+	} {
+		base = append(base, localembed.ManifestFile{Path: p})
+	}
+	m := localembed.Model{RepoID: repoID, Revision: "main", Files: base}
+	dir := t.TempDir()
+
+	res, err := localembed.Download(t.Context(), localembed.DownloadOptions{
+		Model: m, ModelDir: dir, Endpoint: hub.URL,
+	})
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	wantDownloaded := []string{"2_Dense/config.json", "2_Dense/model.safetensors"}
+	for _, want := range wantDownloaded {
+		if !slices.Contains(res.Downloaded, want) {
+			t.Errorf("Downloaded = %v, want it to include %q", res.Downloaded, want)
+		}
+	}
+
+	snapshot, err := localembed.SnapshotDir(dir, localembed.Model{RepoID: repoID, Revision: fakeRevision})
+	if err != nil {
+		t.Fatalf("SnapshotDir: %v", err)
+	}
+	for _, name := range []string{"2_Dense/config.json", "2_Dense/model.safetensors"} {
+		if _, err := os.Stat(filepath.Join(snapshot, filepath.FromSlash(name))); err != nil {
+			t.Errorf("%s not on disk after Download: %v", name, err)
+		}
+	}
+
+	// The model is now actually complete: MissingFiles on the same discovery
+	// must agree, which is what New relies on via ResolvePin at load time.
+	resolved, _, err := localembed.ResolvePin(dir, m)
+	if err != nil {
+		t.Fatalf("ResolvePin: %v", err)
+	}
+	missing, err := localembed.MissingFiles(dir, resolved)
+	if err != nil {
+		t.Fatalf("MissingFiles: %v", err)
+	}
+	if len(missing) != 0 {
+		t.Errorf("MissingFiles = %v, want none after Download discovered the Dense module", missing)
 	}
 }
 
