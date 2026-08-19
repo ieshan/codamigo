@@ -105,6 +105,14 @@ func downloadModelCmd() *cli.Command {
 			}
 			fmt.Printf("      Model directory: %s\n", res.ModelDir)
 
+			if stale, err := localembed.SupersededSnapshots(modelDir, model, res.CommitHash); err == nil && len(stale) > 0 {
+				fmt.Printf("\n[WARN] %d superseded snapshot(s) remain in this model directory.\n", len(stale))
+				fmt.Print("       They are no longer used. Remove them by hand if you want the space:\n")
+				for _, s := range stale {
+					fmt.Printf("         %s (%s)\n", s.Path, humanBytes(s.Bytes))
+				}
+			}
+
 			if cmd.Bool("xla") || cmd.String("cuda") != "" {
 				if err := installPlugins(cmd); err != nil {
 					// Not fatal: the pure-Go backend still works, just slowly.
@@ -114,7 +122,7 @@ func downloadModelCmd() *cli.Command {
 				}
 			}
 
-			printLocalConfigSnippet(model)
+			printLocalConfigSnippet(model, res.Dimensions)
 			return nil
 		},
 	}
@@ -149,15 +157,19 @@ func installPlugins(cmd *cli.Command) error {
 
 // printLocalConfigSnippet tells the user exactly what to add to switch over,
 // including embedding_dimensions, which must match the model or the store will
-// refuse to open.
-func printLocalConfigSnippet(model localembed.Model) {
+// refuse to open. dimensions comes from the model's own config.json, so the
+// unpinned case no longer leaves the user to work it out.
+func printLocalConfigSnippet(model localembed.Model, dimensions int) {
 	name := model.DisplayName()
 	fmt.Printf("\nTo use it, add this to ~/.codamigo/global_settings.yml:\n\n")
 	fmt.Printf("  embedding_provider: local\n")
 	fmt.Printf("  embedding_model: %s\n", name)
-	if model.Dimensions > 0 {
+	switch {
+	case model.Dimensions > 0:
 		fmt.Printf("  embedding_dimensions: %d\n", model.Dimensions)
-	} else {
+	case dimensions > 0:
+		fmt.Printf("  embedding_dimensions: %d\n", dimensions)
+	default:
 		fmt.Printf("  embedding_dimensions: <the model's hidden size — codamigo will tell you>\n")
 	}
 	fmt.Printf("\nThe index stores its vector width, so switch providers with:\n")
@@ -188,7 +200,12 @@ func isModelDownloaded(root string, model localembed.Model) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return localembed.IsDownloaded(dir, model)
+	resolved, _, err := localembed.ResolvePin(dir, model)
+	if err != nil {
+		// No resolvable revision means nothing usable is on disk.
+		return false, nil
+	}
+	return localembed.IsDownloaded(dir, resolved)
 }
 
 // warnIfModelMissing prints an actionable hint when the local provider is
@@ -198,7 +215,13 @@ func warnIfModelMissing(root string, model localembed.Model) {
 	if err != nil {
 		return
 	}
-	missing, err := localembed.MissingFiles(dir, model)
+	resolved, _, err := localembed.ResolvePin(dir, model)
+	if err != nil {
+		fmt.Printf("[FAIL] Model %s is not downloaded (%v)\n", model.DisplayName(), err)
+		fmt.Printf("       Run: codamigo download-model --model %s\n", model.DisplayName())
+		return
+	}
+	missing, err := localembed.MissingFiles(dir, resolved)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			fmt.Printf("[WARN] Could not inspect %s: %v\n", dir, err)

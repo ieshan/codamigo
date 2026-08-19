@@ -167,6 +167,13 @@ func New(opts Options) (*Embedder, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Resolve the revision before anything looks for files: the snapshot
+	// directory is named after the commit hash, so MissingFiles cannot find
+	// anything until the hash is known.
+	descriptor, pin, err := ResolvePin(modelDir, descriptor)
+	if err != nil {
+		return nil, err
+	}
 	missing, err := MissingFiles(modelDir, descriptor)
 	if err != nil {
 		return nil, err
@@ -177,19 +184,43 @@ func New(opts Options) (*Embedder, error) {
 			ErrModelNotDownloaded, descriptor.DisplayName(), len(missing), modelDir, missing[0], descriptor.DisplayName())
 	}
 
-	repo := hub.New(descriptor.RepoID).WithCacheDir(modelDir)
-	if descriptor.Revision != "" {
-		repo = repo.WithRevision(descriptor.Revision)
+	// go-huggingface re-resolves the revision over the network on every load and
+	// ignores its own on-disk cache, so point it at a local shim that answers
+	// from the pin instead. Every *hub.Repo access happens below, during
+	// loading, so the shim can be shut down as soon as New returns.
+	shim, err := startInfoShim(descriptor, pin)
+	if err != nil {
+		return nil, err
 	}
+	defer func() { _ = shim.Close() }()
+
+	// loadErr wraps a failure from any call below that can reach *hub.Repo. If
+	// the shim refused a request, that is almost always the real cause: a file
+	// outside standardManifest that the local snapshot never had. Naming it beats
+	// surfacing the underlying HTTP error, which just says the URL 404ed.
+	loadErr := func(err error, fallback string) error {
+		if missed := shim.missedPaths(); len(missed) > 0 {
+			return fmt.Errorf("%w: %s is not in the local snapshot for %s. "+
+				"Run: codamigo download-model --model %s",
+				ErrModelNotDownloaded, missed[0], descriptor.DisplayName(), descriptor.DisplayName())
+		}
+		return fmt.Errorf("%s: %w", fallback, err)
+	}
+
+	repo := hub.New(descriptor.RepoID).
+		WithCacheDir(modelDir).
+		WithRevision(descriptor.Revision).
+		WithEndpoint(shim.URL)
 	repo.Verbosity = 0
 	// The files are already local, but LoadModel needs the repo's file index.
 	if err := repo.DownloadInfo(false); err != nil {
-		return nil, fmt.Errorf("reading local model info for %s: %w", descriptor.DisplayName(), err)
+		return nil, fmt.Errorf("%w: reading local model info for %s: %v. Run: codamigo download-model --model %s",
+			ErrModelNotDownloaded, descriptor.DisplayName(), err, descriptor.DisplayName())
 	}
 
 	hfModel, err := transformer.LoadModel(repo)
 	if err != nil {
-		return nil, fmt.Errorf("loading %s: %w", descriptor.DisplayName(), err)
+		return nil, loadErr(err, fmt.Sprintf("loading %s", descriptor.DisplayName()))
 	}
 	dim := hfModel.Config.HiddenSize
 	if err := checkDimensions(descriptor, opts.Dimensions, dim); err != nil {
@@ -198,7 +229,7 @@ func New(opts Options) (*Embedder, error) {
 
 	tokenizer, err := hfModel.GetTokenizer()
 	if err != nil {
-		return nil, fmt.Errorf("loading tokenizer for %s: %w", descriptor.DisplayName(), err)
+		return nil, loadErr(err, fmt.Sprintf("loading tokenizer for %s", descriptor.DisplayName()))
 	}
 	padID, err := tokenizer.SpecialTokenID(api.TokPad)
 	if err != nil {
@@ -232,7 +263,7 @@ func New(opts Options) (*Embedder, error) {
 	}
 	if err := hfModel.LoadStore(backend, store); err != nil {
 		cleanup()
-		return nil, fmt.Errorf("loading weights for %s onto %s: %w", descriptor.DisplayName(), backendName, err)
+		return nil, loadErr(err, fmt.Sprintf("loading weights for %s onto %s", descriptor.DisplayName(), backendName))
 	}
 
 	// seqLen is derived inside the graph from the pad token rather than passed as

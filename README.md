@@ -262,7 +262,11 @@ codamigo download-model --model all-MiniLM-L6-v2
 | `--force` | Re-download files that are already present and verified |
 | `--hf-token` | HuggingFace token; only needed for gated or private models |
 
-Re-running is a no-op: files already present with a matching size and hash are skipped. A file that fails verification is deleted before the error is reported, so a retry starts clean.
+Files already present with a matching size and hash are skipped, and a file that fails verification is deleted before the error is reported, so a retry starts clean.
+
+Re-running always re-resolves the revision upstream, which is how you move a model to a newer one. For a built-in model that changes nothing — its revision is fixed. For a bare repository id it means a re-run after upstream's `main` has moved downloads the new revision in full — a fresh 133 MB at `bge-small-en-v1.5`'s size — into a new snapshot. The old snapshot is reported with its path and size and left alone; delete it by hand if you want the space.
+
+Each download also records the resolved commit in `codamigo-pin.json` in the model directory, which is what lets later loads run offline, and prints the model's real `embedding_dimensions` for you to paste into the config.
 
 ---
 
@@ -295,7 +299,9 @@ codamigo reset && codamigo index  # the store records its vector width, so switc
 
 Both are pinned to a fixed revision with per-file checksums, which is what makes `download-model` reproducible rather than just a corruption check.
 
-Any HuggingFace sentence-transformers repository id also works (`embedding_model: some-org/some-model`), but it is **not** checksum-verified, tracks `main`, and requires you to set `embedding_dimensions` yourself. Not every architecture loads: `nomic-ai/nomic-embed-text-v1.5`, for instance, is rejected by the current go-huggingface loader.
+Any HuggingFace sentence-transformers repository id also works (`embedding_model: some-org/some-model`), but it is **not** checksum-verified and requires you to set `embedding_dimensions` yourself — the value `download-model` prints. It resolves `main` at download time and is then pinned to that exact commit, so it never re-downloads on its own; only another `download-model` moves it. Not every architecture loads: `nomic-ai/nomic-embed-text-v1.5`, for instance, is rejected by the current go-huggingface loader.
+
+Loading a model never touches the network: the revision it would otherwise have to look up comes from `codamigo-pin.json` instead. Model directories that predate that file still load offline, deriving the revision from go-huggingface's own cached repository info with no re-download. `codamigo doctor` reports which of the two a model is using.
 
 ### Compute backends and speed
 
