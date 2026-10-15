@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gomlx/go-huggingface/hub"
 )
@@ -44,6 +46,14 @@ type DownloadResult struct {
 	// Verified reports whether checksums were compared. False for an unpinned
 	// repository id, where there is nothing to compare against.
 	Verified bool
+	// CommitHash is the upstream revision the files came from, resolved from
+	// the repository info. Recorded in the pin file so later loads need no
+	// network round trip to rediscover it.
+	CommitHash string
+	// Dimensions is the model's hidden size, read from the downloaded
+	// config.json. Zero when it could not be read. Reported so the caller can
+	// print a real embedding_dimensions value instead of a placeholder.
+	Dimensions int
 }
 
 // Download fetches every manifest file for opts.Model into opts.ModelDir and,
@@ -95,8 +105,41 @@ func Download(ctx context.Context, opts DownloadOptions) (*DownloadResult, error
 	// DownloadInfo resolves the revision and the file list. It does not take a
 	// context upstream, so Ctrl-C during this step is only noticed at the next
 	// ctx check below.
-	if err := repo.DownloadInfo(opts.Force); err != nil {
+	//
+	// Forced unconditionally: download-model is the one command that is meant to
+	// consult upstream, and DownloadInfo otherwise reuses a cached info file and
+	// would never observe that the tracked branch had moved. Loads never reach
+	// this code — they answer the same query from the pin file instead.
+	if err := repo.DownloadInfo(true); err != nil {
 		return nil, downloadError(err, m, opts.Token)
+	}
+
+	// Resolve the concrete commit hash once, right after DownloadInfo wrote the
+	// info file, and before the per-file loop. SnapshotDir now requires a
+	// concrete hash — existingFile (via fetchFile) would otherwise be handed
+	// m's unresolved "main" for an unpinned model and silently treat every file
+	// as absent, turning an idempotent second run into a full re-download.
+	rev := m.Revision
+	if rev == "" {
+		rev = "main"
+	}
+	hash, infoBody, err := readDownloadInfo(opts.ModelDir, m, rev)
+	if err != nil {
+		return nil, err
+	}
+	opts.Model.Revision = hash
+
+	// An unpinned repository id's manifest may still be missing files that
+	// only modules.json itself reveals (a Dense projection, a Normalize
+	// step) — discover them now, before the loop below decides the download
+	// is complete. Registry models keep their hand-verified manifest as is.
+	if !m.Registered {
+		expanded, err := expandUnpinnedManifest(ctx, repo, opts, m, infoBody)
+		if err != nil {
+			return nil, err
+		}
+		m.Files = expanded
+		opts.Model.Files = expanded
 	}
 
 	result := &DownloadResult{ModelDir: opts.ModelDir, Verified: m.Pinned()}
@@ -118,7 +161,119 @@ func Download(ctx context.Context, opts DownloadOptions) (*DownloadResult, error
 		}
 	}
 
+	pin, err := writeDownloadPin(opts, rev, hash, infoBody)
+	if err != nil {
+		return nil, err
+	}
+	result.CommitHash = pin.CommitHash
+	result.Dimensions = pin.Dimensions
+
 	return result, nil
+}
+
+// readDownloadInfo reads and parses the repository info file go-huggingface
+// just wrote for rev, returning the resolved commit hash and the raw body as
+// read from disk. Reading the file directly rather than calling repo.Info()
+// avoids a nil dereference nilaway would reject. The body is what becomes the
+// pin's RepoInfo; note that WritePin's json.Marshal compacts and HTML-escapes
+// it, so what the shim later replays is semantically equivalent, not
+// byte-identical, to what is read here.
+func readDownloadInfo(modelDir string, m Model, rev string) (hash string, body []byte, err error) {
+	repoDir := filepath.Join(modelDir, flatRepoDir(m.RepoID))
+	infoPath := filepath.Join(repoDir, "info", rev)
+	// #nosec G304 -- infoPath is inside the model directory this call just populated
+	body, err = os.ReadFile(infoPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("reading repository info for %s at %s: %w", m.DisplayName(), infoPath, err)
+	}
+	var meta struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.Unmarshal(body, &meta); err != nil {
+		return "", nil, fmt.Errorf("parsing repository info for %s at %s: %w", m.DisplayName(), infoPath, err)
+	}
+	if !isCommitHash(meta.SHA) {
+		return "", nil, fmt.Errorf("repository info for %s at %s has no valid sha", m.DisplayName(), infoPath)
+	}
+	return meta.SHA, body, nil
+}
+
+// writeDownloadPin records the revision this download resolved to, so loading
+// the model later needs no network access. hash and body are the values
+// [readDownloadInfo] already parsed from the info file before the per-file
+// loop, reused here rather than read a second time.
+func writeDownloadPin(opts DownloadOptions, rev, hash string, body []byte) (Pin, error) {
+	m := opts.Model
+	repoDir := filepath.Join(opts.ModelDir, flatRepoDir(m.RepoID))
+	pin := Pin{
+		RepoID:       m.RepoID,
+		CommitHash:   hash,
+		ResolvedFrom: rev,
+		ResolvedAt:   time.Now().UTC(),
+		Dimensions:   snapshotHiddenSize(repoDir, hash),
+		RepoInfo:     body,
+	}
+	if err := WritePin(opts.ModelDir, pin); err != nil {
+		return Pin{}, err
+	}
+	return pin, nil
+}
+
+// snapshotHiddenSize reads hidden_size from the downloaded config.json.
+//
+// This is the same quantity New cross-checks against embedding_dimensions via
+// the loaded model's Config.HiddenSize, so recording it introduces no second
+// notion of width. Failure returns 0: the value is only used to print a helpful
+// default, and a download must not fail because of it.
+func snapshotHiddenSize(repoDir, commitHash string) int {
+	// #nosec G304 -- path is inside the model directory this call just populated
+	body, err := os.ReadFile(filepath.Join(repoDir, "snapshots", commitHash, "config.json"))
+	if err != nil {
+		return 0
+	}
+	var cfg struct {
+		HiddenSize int `json:"hidden_size"`
+	}
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		return 0
+	}
+	return cfg.HiddenSize
+}
+
+// expandUnpinnedManifest fetches modules.json ahead of the main download loop
+// below and folds in whatever extra module files it declares, via
+// [expandManifest]. Fetching it early — rather than waiting for the main loop
+// to reach it in manifest order — is what lets the loop's single pass over
+// m.Files download everything a Dense projection or Normalize module needs,
+// instead of only ever knowing about the plain Transformer+Pooling pair.
+//
+// The fetch here is not wasted work: fetchFile is idempotent, so the main loop
+// downloading modules.json again a moment later just finds it already present.
+func expandUnpinnedManifest(ctx context.Context, repo *hub.Repo, opts DownloadOptions, m Model, infoBody []byte) ([]ManifestFile, error) {
+	modulesFile, ok := findManifestFile(m.Files, "modules.json")
+	if !ok {
+		return m.Files, nil
+	}
+	path, _, err := fetchFile(ctx, repo, opts, modulesFile)
+	if err != nil {
+		return nil, err
+	}
+	// #nosec G304 -- path is inside the model directory this call just populated
+	modulesJSON, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading modules.json to discover extra model files: %w", err)
+	}
+	return expandManifest(modulesJSON, infoBody, m.Files)
+}
+
+// findManifestFile looks up one manifest entry by path.
+func findManifestFile(files []ManifestFile, path string) (ManifestFile, bool) {
+	for _, f := range files {
+		if f.Path == path {
+			return f, true
+		}
+	}
+	return ManifestFile{}, false
 }
 
 // fetchFile downloads one manifest file unless an acceptable copy is already

@@ -1,6 +1,7 @@
 package localembed
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -57,6 +58,97 @@ var standardManifest = []string{
 	"tokenizer_config.json",
 	"1_Pooling/config.json",
 	"model.safetensors",
+}
+
+// expandManifest augments base with the extra files modulesJSON declares
+// beyond the plain Transformer+Pooling pair, using the sizes and hashes
+// repoInfo already reports.
+//
+// standardManifest — what base is for an unpinned repository id — only covers
+// module 0 (the bare Transformer, path "") and module 1 (1_Pooling). A model
+// such as google/embeddinggemma-300m adds a Dense projection module ("2_Dense")
+// or a Normalize step, each with its own files at "<path>/<name>" inside the
+// same repository; without this, Download reports success while
+// transformer.LoadModel still needs a file that was never fetched, and
+// MissingFiles reports the model ready when it is not (see the
+// pinned-model-revision design doc's "Known limitations"). Widening
+// standardManifest itself was rejected there: every registry entry is
+// hand-verified against exactly the plain set, so this only ever runs for a
+// model discovered from a raw repository id, which has no such guarantee to
+// begin with.
+//
+// Extra files are inserted before base's model.safetensors, if present, so a
+// small metadata file added here still fails fast rather than waiting behind
+// whatever multi-hundred-megabyte download was already in flight — the same
+// reasoning that orders standardManifest itself.
+func expandManifest(modulesJSON, repoInfo []byte, base []ManifestFile) ([]ManifestFile, error) {
+	var modules []struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(modulesJSON, &modules); err != nil {
+		return nil, fmt.Errorf("parsing modules.json: %w", err)
+	}
+
+	extraModules := make(map[string]bool)
+	for _, mod := range modules {
+		if mod.Path == "" || mod.Path == "1_Pooling" {
+			continue
+		}
+		extraModules[mod.Path] = true
+	}
+	if len(extraModules) == 0 {
+		return base, nil
+	}
+
+	var info struct {
+		Siblings []struct {
+			RFilename string `json:"rfilename"`
+			Size      int64  `json:"size"`
+			LFS       *struct {
+				SHA256 string `json:"sha256"`
+			} `json:"lfs"`
+		} `json:"siblings"`
+	}
+	if err := json.Unmarshal(repoInfo, &info); err != nil {
+		return nil, fmt.Errorf("parsing repository info: %w", err)
+	}
+
+	known := make(map[string]bool, len(base))
+	for _, f := range base {
+		known[f.Path] = true
+	}
+	var extraFiles []ManifestFile
+	for _, sib := range info.Siblings {
+		if known[sib.RFilename] {
+			continue
+		}
+		dir, _, ok := strings.Cut(sib.RFilename, "/")
+		if !ok || !extraModules[dir] {
+			continue
+		}
+		f := ManifestFile{Path: sib.RFilename, Size: sib.Size}
+		if sib.LFS != nil {
+			f.SHA256 = sib.LFS.SHA256
+		}
+		extraFiles = append(extraFiles, f)
+		known[sib.RFilename] = true
+	}
+	if len(extraFiles) == 0 {
+		return base, nil
+	}
+
+	insertAt := len(base)
+	for i, f := range base {
+		if f.Path == "model.safetensors" {
+			insertAt = i
+			break
+		}
+	}
+	files := make([]ManifestFile, 0, len(base)+len(extraFiles))
+	files = append(files, base[:insertAt]...)
+	files = append(files, extraFiles...)
+	files = append(files, base[insertAt:]...)
+	return files, nil
 }
 
 // DefaultModel is the model used when embedding_model names no other. It is

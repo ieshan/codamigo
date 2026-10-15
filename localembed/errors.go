@@ -44,4 +44,9 @@ var (
 	// ErrUnknownModel reports that a model short name is not in the registry and
 	// is not a usable HuggingFace repository id.
 	ErrUnknownModel = errors.New("unknown model")
+
+	// ErrNoPin reports that a model directory has no usable pin file. It is an
+	// internal signal, not a user-facing failure: callers fall through to
+	// deriving the revision from go-huggingface's cached info file.
+	ErrNoPin = errors.New("no usable pin file")
 )

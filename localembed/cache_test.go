@@ -1,7 +1,6 @@
 package localembed_test
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -96,52 +95,37 @@ func TestSnapshotDir_PinnedRevision(t *testing.T) {
 	}
 }
 
-func TestSnapshotDir_UnpinnedDiscoversRevision(t *testing.T) {
-	m, err := localembed.Lookup("org/model")
-	if err != nil {
-		t.Fatalf("Lookup: %v", err)
-	}
+func TestSnapshotDir_UsesRevisionDirectly(t *testing.T) {
 	root := t.TempDir()
-	snapshots := filepath.Join(root, "models--org--model", "snapshots", "abc123")
-	if err := os.MkdirAll(snapshots, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	dir, err := localembed.SnapshotDir(root, m)
+	m := localembed.Model{RepoID: "org/model", Revision: testHash}
+	want := filepath.Join(root, "models--org--model", "snapshots", testHash)
+
+	got, err := localembed.SnapshotDir(root, m)
 	if err != nil {
 		t.Fatalf("SnapshotDir: %v", err)
 	}
-	if dir != snapshots {
-		t.Errorf("SnapshotDir = %q, want %q", dir, snapshots)
+	if got != want {
+		t.Errorf("SnapshotDir = %q, want %q", got, want)
 	}
 }
 
-func TestSnapshotDir_UnpinnedMissing(t *testing.T) {
-	m, err := localembed.Lookup("org/model")
-	if err != nil {
-		t.Fatalf("Lookup: %v", err)
-	}
-	_, err = localembed.SnapshotDir(t.TempDir(), m)
-	if !errors.Is(err, localembed.ErrModelNotDownloaded) {
-		t.Errorf("SnapshotDir on an empty root = %v, want ErrModelNotDownloaded", err)
-	}
-}
-
-// TestSnapshotDir_UnpinnedAmbiguous asserts we refuse rather than guess:
-// silently loading the wrong revision's weights would produce vectors that are
-// incompatible with the index without any error.
-func TestSnapshotDir_UnpinnedAmbiguous(t *testing.T) {
-	m, err := localembed.Lookup("org/model")
-	if err != nil {
-		t.Fatalf("Lookup: %v", err)
-	}
+func TestSnapshotDir_DoesNotRequireTheDirectoryToExist(t *testing.T) {
+	// SnapshotDir names a path; MissingFiles is what decides whether the files
+	// are there. Several revisions side by side is no longer ambiguous, because
+	// the pin says which one to use.
 	root := t.TempDir()
-	for _, rev := range []string{"abc", "def"} {
-		if err := os.MkdirAll(filepath.Join(root, "models--org--model", "snapshots", rev), 0o755); err != nil {
+	repoDir := filepath.Join(root, "models--org--model", "snapshots")
+	for _, rev := range []string{testHash, "89abcdef0123456789abcdef0123456789abcdef"} {
+		if err := os.MkdirAll(filepath.Join(repoDir, rev), 0o750); err != nil {
 			t.Fatalf("MkdirAll: %v", err)
 		}
 	}
-	if _, err := localembed.SnapshotDir(root, m); err == nil {
-		t.Error("SnapshotDir with two revisions = nil error, want refusal")
+	got, err := localembed.SnapshotDir(root, localembed.Model{RepoID: "org/model", Revision: testHash})
+	if err != nil {
+		t.Fatalf("SnapshotDir with two revisions present: %v", err)
+	}
+	if got != filepath.Join(repoDir, testHash) {
+		t.Errorf("SnapshotDir = %q, want the pinned revision %q", got, filepath.Join(repoDir, testHash))
 	}
 }
 
@@ -259,6 +243,132 @@ func TestMissingFiles_DanglingSymlink(t *testing.T) {
 	}
 	if !slices.Contains(missing, m.Files[0].Path) {
 		t.Errorf("MissingFiles = %v, want it to include the dangling %s", missing, m.Files[0].Path)
+	}
+}
+
+func TestSupersededSnapshots(t *testing.T) {
+	const stale = "89abcdef0123456789abcdef0123456789abcdef"
+	root := t.TempDir()
+	snapshots := filepath.Join(root, "models--org--model", "snapshots")
+	for _, rev := range []string{testHash, stale} {
+		if err := os.MkdirAll(filepath.Join(snapshots, rev), 0o750); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(snapshots, rev, "w.bin"), []byte("12345"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	got, err := localembed.SupersededSnapshots(root, localembed.Model{RepoID: "org/model"}, testHash)
+	if err != nil {
+		t.Fatalf("SupersededSnapshots: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d superseded snapshots, want 1: %+v", len(got), got)
+	}
+	if got[0].Path != filepath.Join(snapshots, stale) {
+		t.Errorf("Path = %q, want %q", got[0].Path, filepath.Join(snapshots, stale))
+	}
+	if got[0].Bytes != 5 {
+		t.Errorf("Bytes = %d, want 5", got[0].Bytes)
+	}
+}
+
+func TestSupersededSnapshots_NoneWhenOnlyKeepExists(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "models--org--model", "snapshots", testHash), 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	got, err := localembed.SupersededSnapshots(root, localembed.Model{RepoID: "org/model"}, testHash)
+	if err != nil {
+		t.Fatalf("SupersededSnapshots: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %+v, want none", got)
+	}
+}
+
+func TestSupersededSnapshots_MissingDirIsNotAnError(t *testing.T) {
+	got, err := localembed.SupersededSnapshots(t.TempDir(), localembed.Model{RepoID: "org/model"}, testHash)
+	if err != nil {
+		t.Fatalf("SupersededSnapshots on empty root: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %+v, want none", got)
+	}
+}
+
+// TestSupersededSnapshots_SharedBlobsNotCounted covers go-huggingface's real
+// layout: snapshot entries are symlinks into a shared blobs/ directory,
+// deduplicated by etag. Deleting a superseded snapshot only removes its
+// symlinks, not blobs still referenced by the kept snapshot, so those bytes
+// are not actually reclaimable and must not be counted. Without the fix this
+// reports the sum of both blobs (shared + unique) instead of only the unique
+// one.
+func TestSupersededSnapshots_SharedBlobsNotCounted(t *testing.T) {
+	const stale = "89abcdef0123456789abcdef0123456789abcdef"
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "models--org--model")
+	blobs := filepath.Join(repoDir, "blobs")
+	if err := os.MkdirAll(blobs, 0o750); err != nil {
+		t.Fatalf("MkdirAll blobs: %v", err)
+	}
+	sharedBlob := filepath.Join(blobs, "shared")
+	keepOnlyBlob := filepath.Join(blobs, "keep-only")
+	staleOnlyBlob := filepath.Join(blobs, "stale-only")
+	for path, content := range map[string]string{
+		sharedBlob:    "shared-weights-unchanged",
+		keepOnlyBlob:  "new-config",
+		staleOnlyBlob: "only-in-stale",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("WriteFile %s: %v", path, err)
+		}
+	}
+
+	snapshots := filepath.Join(repoDir, "snapshots")
+	keepDir := filepath.Join(snapshots, testHash)
+	staleDir := filepath.Join(snapshots, stale)
+	if err := os.MkdirAll(keepDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll keep: %v", err)
+	}
+	if err := os.MkdirAll(staleDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll stale: %v", err)
+	}
+
+	// The kept snapshot's weights did not change (still points at the shared
+	// blob) but its config did (points at a blob the stale snapshot never
+	// referenced). This link uses a relative target, matching what
+	// go-huggingface actually writes (e.g. "../../blobs/<etag>"), so
+	// resolveSymlink's relative-path branch is exercised too, not just the
+	// absolute-path one the other three links below use.
+	sharedBlobRel, err := filepath.Rel(keepDir, sharedBlob)
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	if err := os.Symlink(sharedBlobRel, filepath.Join(keepDir, "model.bin")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(keepOnlyBlob, filepath.Join(keepDir, "config.json")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	// The stale snapshot shares the weights blob but has its own extra file.
+	if err := os.Symlink(sharedBlob, filepath.Join(staleDir, "model.bin")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if err := os.Symlink(staleOnlyBlob, filepath.Join(staleDir, "extra.bin")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	got, err := localembed.SupersededSnapshots(root, localembed.Model{RepoID: "org/model"}, testHash)
+	if err != nil {
+		t.Fatalf("SupersededSnapshots: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d superseded snapshots, want 1: %+v", len(got), got)
+	}
+	want := int64(len("only-in-stale"))
+	if got[0].Bytes != want {
+		t.Errorf("Bytes = %d, want %d (only the blob not shared with the kept snapshot)", got[0].Bytes, want)
 	}
 }
 

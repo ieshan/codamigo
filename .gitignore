@@ -14,7 +14,12 @@ dist/
 bin/
 
 # Build artifacts
+# Both patterns are anchored on purpose. A bare "codamigo" would also match the
+# cmd/codamigo source directory and hide every file added under it.
 /codamigo
+# `go build ./cmd/codamigo/` run from inside that directory, rather than the
+# `make build` target, leaves the binary here.
+/cmd/codamigo/codamigo
 /build/
 
 # Test artifacts
